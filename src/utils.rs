@@ -1,355 +1,350 @@
 use crate::dathost_models::DathostServerDuplicateResponse;
+use crate::error::Error;
 use crate::{Config, DBConnectionPool, DathostConfig, Setup, SetupStep};
-use csgo_matchbot::models::SeriesType::Bo5;
+use anyhow::{anyhow, bail};
+use csgo_matchbot::helpers::create_server_conn_button_row;
 use csgo_matchbot::models::StepType::{Pick, Veto};
-use csgo_matchbot::models::{
-    Match, MatchServer, MatchSetupStep, MatchState, NewMatchSetupStep, NewSeriesMap, SeriesType,
-    StepType,
-};
+use csgo_matchbot::models::{Match, MatchSetupStep, MatchState, SeriesType};
 use csgo_matchbot::{
-    create_match_setup_steps, create_series_maps, get_fresh_token, get_map_pool, get_match_servers,
-    get_user_by_discord_id, update_match_state, update_token,
+    create_match_setup_step, create_series_map, get_fresh_token, get_map_pool,
+    get_user_by_discord_id, update_match_state, update_token, DiscordId, SeriesMap,
 };
-use std::time::Duration;
-use diesel::PgConnection;
-use r2d2::PooledConnection;
-use r2d2_diesel::ConnectionManager;
-use reqwest::{Client, Error, Response};
-use serenity::builder::{CreateActionRow, CreateButton, CreateSelectMenu, CreateSelectMenuOption};
-use serenity::futures::StreamExt;
-use serenity::model::application::component::ButtonStyle;
+use futures::stream::{self, StreamExt};
+use once_cell::sync::Lazy;
+use reqwest::{Client, Response, StatusCode};
 use serenity::model::application::interaction::application_command::ApplicationCommandInteraction;
 use serenity::model::application::interaction::message_component::MessageComponentInteraction;
 use serenity::model::application::interaction::InteractionResponseType;
-use serenity::model::channel::{Message, ReactionType};
+use serenity::model::channel::Message;
 use serenity::model::id::GuildId;
-use serenity::model::prelude::{GuildContainer, Role, RoleId, User};
+use serenity::model::prelude::interaction::application_command::CommandDataOptionValue;
+use serenity::model::prelude::{Member, Role, RoleId, User};
 use serenity::prelude::Context;
 use serenity::utils::MessageBuilder;
+use sqlx::PgPool;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
+use steamid::SteamId;
 use urlencoding::encode;
 
-pub(crate) fn convert_steamid_to_64(steamid: &str) -> u64 {
-    let steamid_split: Vec<&str> = steamid.split(':').collect();
-    let y = steamid_split[1].parse::<i64>().unwrap();
-    let z = steamid_split[2].parse::<i64>().unwrap();
-    ((z * 2) + y + 76561197960265728) as u64
-}
-
-pub(crate) async fn find_user_team_role(
-    all_guild_roles: Vec<Role>,
+pub async fn find_user_team_role(
+    guild_roles: &[Role],
     user: &User,
-    context: &&Context,
-) -> Result<Role, String> {
-    let team_roles: Vec<Role> = all_guild_roles
-        .into_iter()
+    context: &Context,
+) -> anyhow::Result<Role> {
+    let team_roles = guild_roles
+        .iter()
         .filter(|r| r.name.starts_with("Team"))
-        .collect();
+        .collect::<Vec<_>>();
+
     for team_role in team_roles {
         if let Ok(has_role) = user
-            .has_role(&context.http, team_role.guild_id, team_role.id)
+            .has_role(context, team_role.guild_id, team_role.id)
             .await
         {
             if !has_role {
                 continue;
             }
-            return Ok(team_role);
+            return Ok(team_role.clone());
         }
     }
-    Err(String::from("User does not have a team role"))
+
+    bail!("User does not have a team role");
 }
 
-pub(crate) async fn user_team_author(
+pub async fn user_team_author(
     context: &Context,
     setup: &Setup,
-    msg: &Arc<MessageComponentInteraction>,
-) -> Result<u64, String> {
-    let role_one = RoleId::from(setup.clone().team_one.unwrap() as u64).0;
-    let role_two = RoleId::from(setup.clone().team_two.unwrap() as u64).0;
-    if let Ok(has_role_one) = msg
+    component_interation: &Arc<MessageComponentInteraction>,
+) -> anyhow::Result<u64> {
+    let team_one = setup.team_one.unwrap() as u64;
+    let team_two = setup.team_two.unwrap() as u64;
+    let guild_id = component_interation.guild_id.unwrap();
+
+    let is_team_one = component_interation
         .user
-        .has_role(&context.http, msg.guild_id.unwrap(), role_one)
-        .await
-    {
-        if has_role_one {
-            return Ok(role_one);
-        }
-        if let Ok(has_role_two) = msg
-            .user
-            .has_role(&context.http, msg.guild_id.unwrap(), role_two)
-            .await
-        {
-            if has_role_two {
-                return Ok(role_two);
-            }
-        }
+        .has_role(&context, guild_id, team_one)
+        .await?;
+    if is_team_one {
+        return Ok(team_one);
     }
-    Err(String::from(
-        "You are not part of either team currently running `/setup`",
-    ))
+
+    let is_team_two = component_interation
+        .user
+        .has_role(&context, guild_id, team_two)
+        .await?;
+    if is_team_two {
+        return Ok(team_two);
+    }
+
+    bail!("You are not part of either team currently running `/setup`");
 }
 
-pub(crate) async fn admin_check(
+pub async fn admin_check(
     context: &Context,
-    inc_command: &ApplicationCommandInteraction,
-) -> Result<String, String> {
-    let data = context.data.write().await;
-    let config: &Config = data.get::<Config>().unwrap();
+    interaction: &ApplicationCommandInteraction,
+) -> anyhow::Result<()> {
+    let data = context.data.read().await;
+    let config = data
+        .get::<Config>()
+        .ok_or_else(|| anyhow!("config missing from context"))?;
+    let guild_id = interaction
+        .guild_id
+        .ok_or_else(|| anyhow!("interaction has no guild"))?;
+    let role_id = RoleId::from(config.discord.admin_role_id);
+
+    let user_has_role = interaction
+        .user
+        .has_role(context, guild_id, role_id)
+        .await
+        .unwrap_or(false);
+
+    if user_has_role {
+        return Ok(());
+    }
+
     let role_name = context
         .cache
-        .role(
-            inc_command.guild_id.unwrap(),
-            RoleId::from(config.discord.admin_role_id),
-        )
-        .unwrap()
-        .name;
-    return if inc_command
-        .user
-        .has_role(
-            &context.http,
-            GuildContainer::from(inc_command.guild_id.unwrap()),
-            RoleId::from(config.discord.admin_role_id),
-        )
-        .await
-        .unwrap_or(false)
-    {
-        Ok(String::from("User has admin role"))
-    } else {
-        Err(MessageBuilder::new()
-            .mention(&inc_command.user)
-            .push(" this command requires the '")
-            .push(role_name)
-            .push("' role.")
-            .build())
-    };
+        .role(guild_id, role_id)
+        .map(|role| role.name)
+        .ok_or_else(|| anyhow!("admin role not found"))?;
+    bail!(MessageBuilder::new()
+        .mention(&interaction.user)
+        .push(" this command requires the '")
+        .push(role_name)
+        .push("' role.")
+        .build());
 }
 
-pub(crate) async fn get_maps(context: &Context) -> Vec<String> {
-    let conn = get_pg_conn(context).await;
-    let map_pool = get_map_pool(&conn);
-    map_pool.into_iter().map(|m| m.name).collect()
+pub async fn get_maps(context: &Context) -> anyhow::Result<Vec<String>> {
+    Ok(get_map_pool(&get_pool(context).await?)
+        .await?
+        .into_iter()
+        .map(|m| m.name)
+        .collect())
 }
 
-pub(crate) async fn get_servers(context: &Context) -> Vec<MatchServer> {
-    let conn = get_pg_conn(context).await;
-    get_match_servers(&conn)
-}
+pub async fn finish_setup(context: &Context, setup: &Setup) -> anyhow::Result<()> {
+    let pool = get_pool(context).await?;
+    let mut transaction = pool.begin().await?;
 
-pub(crate) async fn finish_setup(context: &Context, setup_final: &Setup) {
-    let mut match_setup_steps: Vec<NewMatchSetupStep> = Vec::new();
-    let match_id = setup_final.match_id.unwrap();
-    let conn = get_pg_conn(context).await;
-    for v in &setup_final.veto_pick_order {
-        let step = NewMatchSetupStep {
+    let match_id = setup.match_id.unwrap();
+    for setup_step in &setup.veto_pick_order {
+        let new_step = MatchSetupStep {
+            id: None,
             match_id,
-            step_type: v.step_type,
-            team_role_id: v.team_role_id,
-            map: Option::from(v.map.clone().unwrap()),
+            step_type: setup_step.step_type,
+            team_role_id: setup_step.team_role_id,
+            map: setup_step.map.clone(),
         };
-        match_setup_steps.push(step);
+
+        create_match_setup_step(&mut transaction, new_step).await?;
     }
-    let mut series_maps: Vec<NewSeriesMap> = Vec::new();
-    let match_id = setup_final.match_id.unwrap();
-    for m in &setup_final.maps {
-        let step = NewSeriesMap {
+
+    for setup_map in &setup.maps {
+        let new_series_map = SeriesMap {
+            id: None,
             match_id,
-            map: m.map.clone(),
-            picked_by_role_id: m.picked_by,
-            start_attack_team_role_id: m.start_attack_team_role_id,
-            start_defense_team_role_id: m.start_defense_team_role_id,
+            map: setup_map.map.clone(),
+            picked_by_role_id: setup_map.picked_by,
+            start_attack_team_role_id: setup_map.start_attack_team_role_id,
+            start_defense_team_role_id: setup_map.start_defense_team_role_id,
         };
-        series_maps.push(step);
+
+        create_series_map(&mut transaction, new_series_map).await?;
     }
-    create_match_setup_steps(&conn, match_setup_steps.clone());
-    create_series_maps(&conn, series_maps.clone());
-    update_match_state(&conn, match_id, MatchState::Completed);
+
+    update_match_state(&mut transaction, match_id, MatchState::Completed).await?;
+    Ok(transaction.commit().await?)
 }
 
-pub(crate) fn print_veto_info(setup_info: &Vec<MatchSetupStep>, m: &Match) -> String {
+pub fn print_veto_info(setup_info: &Vec<MatchSetupStep>, match_: &Match) -> anyhow::Result<String> {
     if setup_info.is_empty() {
-        return String::from("_This match has no veto info yet_");
+        bail!("_This match has no veto info yet_");
     }
-    let mut resp = String::from("```diff\n");
+
     let veto: String = setup_info
         .clone()
         .iter()
-        .map(|v| {
-            let mut veto_str = String::new();
-            let team_name = if m.team_one_role_id == v.team_role_id {
-                &m.team_one_name
-            } else {
-                &m.team_two_name
-            };
-            if v.map.is_none() {
-                return veto_str;
-            }
-            if v.step_type == Veto {
-                veto_str.push_str(
-                    format!(
-                        "- {} banned {}\n",
-                        team_name,
-                        v.map.clone().unwrap().to_lowercase()
-                    )
-                    .as_str(),
-                );
-            } else {
-                veto_str.push_str(
-                    format!(
-                        "+ {} picked {}\n",
-                        team_name,
-                        v.map.clone().unwrap().to_lowercase()
-                    )
-                    .as_str(),
-                );
-            }
-            veto_str
+        .filter(|veto| {
+            veto.map
+                .as_deref()
+                .map(|map| !map.is_empty())
+                .unwrap_or(false)
         })
-        .collect();
-    resp.push_str(veto.as_str());
-    resp.push_str("```");
-    resp
-}
+        .map(|veto| {
+            let team_name = if match_.team_one_role_id == veto.team_role_id {
+                &match_.team_one_name
+            } else {
+                &match_.team_two_name
+            };
 
-pub(crate) fn print_match_info(m: &Match, show_id: bool) -> String {
-    let mut schedule_str = String::new();
-    if let Some(schedule) = &m.scheduled_time_str {
-        schedule_str = format!(" > Scheduled: `{}`", schedule);
-    }
-    let mut row = String::new();
-    row.push_str(
-        format!(
-            "- {} vs {}{}",
-            m.team_one_name, m.team_two_name, schedule_str
-        )
-        .as_str(),
-    );
-    if m.note.is_some() {
-        row.push_str(format!(" `{}`", m.note.clone().unwrap()).as_str());
-    }
-    row.push('\n');
-    if show_id {
-        row.push_str(format!("    _Match ID:_ `{}\n`", m.id).as_str())
-    }
-    row
-}
+            let map = veto
+                .map
+                .as_ref()
+                .ok_or_else::<Infallible, _>(|| unreachable!())?
+                .to_lowercase();
 
-pub(crate) fn eos_printout(setup: &Setup) -> String {
-    let mut resp = String::from("\n\nSetup is completed. GLHF!\n\n");
-    for (i, el) in setup.maps.iter().enumerate() {
-        resp.push_str(
-            format!(
-                "**{}. {}** - picked by: <@&{}>\n    _CT start:_ <@&{}>\n    _T start:_ <@&{}>\n\n",
-                i + 1,
-                el.map.to_lowercase(),
-                &el.picked_by,
-                el.start_defense_team_role_id.unwrap(),
-                el.start_attack_team_role_id.unwrap()
-            )
-            .as_str(),
-        )
-    }
-    resp
-}
-
-pub async fn no_team_resp(context: &Context, mci: &Arc<MessageComponentInteraction>) {
-    mci.create_interaction_response(&context, |r| {
-        r.kind(InteractionResponseType::ChannelMessageWithSource)
-            .interaction_response_data(|d| {
-                d.ephemeral(true)
-                    .content("You are not part of either team currently setting up a match")
+            Ok(if veto.step_type == Veto {
+                format!("- {} banned {}\n", team_name, map)
+            } else {
+                format!("+ {} picked {}\n", team_name, map)
             })
-    })
-    .await
-    .unwrap();
+        })
+        .collect::<anyhow::Result<String>>()?;
+
+    Ok(format!("```diff\n{veto}\n```"))
 }
 
-pub(crate) async fn handle_bo1_setup(setup: Setup) -> (Vec<SetupStep>, String) {
+pub fn print_match_info(match_: &Match, show_id: bool) -> String {
+    let scheduled = match_
+        .scheduled_time_str
+        .as_deref()
+        .map(|time| format!(" > Scheduled: `{}`", time));
+    let scheduled = scheduled.as_deref().unwrap_or("");
+    let note = match_.note.as_ref().map(|note| format!(" `{}`", note));
+    let note = note.as_deref().unwrap_or("");
+    let id = show_id
+        .then_some(match_.id)
+        .flatten()
+        .map(|id| format!("    _Match ID:_ `{}\n`", id));
+    let id = id.as_deref().unwrap_or("");
+
+    format!(
+        "- {} vs {}{}{}{}",
+        match_.team_one_name, match_.team_two_name, scheduled, note, id
+    )
+}
+
+pub fn eos_printout(setup: &Setup) -> String {
+    let maps = setup.maps.iter().enumerate().map(|(index, map)| {
+        format!(
+            "**{}. {}** - picked by: <@&{}>\n    _CT start:_ <@&{}>\n    _T start:_ <@&{}>\n",
+            index + 1,
+            map.map.to_lowercase(),
+            &map.picked_by,
+            map.start_defense_team_role_id.unwrap(),
+            map.start_attack_team_role_id.unwrap()
+        )
+    });
+
+    Some(String::from("\n\nSetup is completed. GLHF!\n"))
+        .into_iter()
+        .chain(maps)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub async fn interaction_response(
+    context: &Context,
+    interaction: &Arc<MessageComponentInteraction>,
+    content: &str,
+) -> serenity::Result<()> {
+    interaction
+        .create_interaction_response(&context, |response| {
+            response
+                .kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|response_data| {
+                    response_data.ephemeral(true).content(content)
+                })
+        })
+        .await
+}
+
+pub fn handle_bo1_setup(setup: &Setup) -> (Vec<SetupStep>, String) {
     let match_id = setup.match_id.unwrap();
+    let team_one = setup.team_one.unwrap();
+    let team_two = setup.team_two.unwrap();
+
     (
         vec![
             SetupStep {
                 match_id,
                 step_type: Veto,
-                team_role_id: setup.team_two.unwrap() as i64,
+                team_role_id: team_two,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Veto,
-                team_role_id: setup.team_one.unwrap() as i64,
+                team_role_id: team_one,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Veto,
-                team_role_id: setup.team_two.unwrap() as i64,
+                team_role_id: team_two,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Veto,
-                team_role_id: setup.team_one.unwrap() as i64,
+                team_role_id: team_one,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Veto,
-                team_role_id: setup.team_two.unwrap() as i64,
+                team_role_id: team_two,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Pick,
-                team_role_id: setup.team_one.unwrap() as i64,
+                team_role_id: team_one,
                 map: None,
             },
         ],
         format!(
             "Best of 1 option selected. Starting map veto. <@&{}> bans first.\n",
-            &setup.team_two.unwrap()
+            &team_two
         ),
     )
 }
 
-pub(crate) async fn handle_bo3_setup(setup: Setup) -> (Vec<SetupStep>, String) {
+pub fn handle_bo3_setup(setup: &Setup) -> (Vec<SetupStep>, String) {
     let match_id = setup.match_id.unwrap();
+    let team_one = setup.team_one.unwrap();
+    let team_two = setup.team_two.unwrap();
+
     (
         vec![
             SetupStep {
                 match_id,
                 step_type: Veto,
-                team_role_id: setup.team_one.unwrap() as i64,
+                team_role_id: team_one,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Veto,
-                team_role_id: setup.team_two.unwrap() as i64,
+                team_role_id: team_two,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Pick,
-                team_role_id: setup.team_one.unwrap() as i64,
+                team_role_id: team_one,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Pick,
-                team_role_id: setup.team_two.unwrap() as i64,
+                team_role_id: team_two,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Veto,
-                team_role_id: setup.team_two.unwrap() as i64,
+                team_role_id: team_two,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Pick,
-                team_role_id: setup.team_one.unwrap() as i64,
+                team_role_id: team_one,
                 map: None,
             },
         ],
@@ -360,438 +355,455 @@ pub(crate) async fn handle_bo3_setup(setup: Setup) -> (Vec<SetupStep>, String) {
     )
 }
 
-pub(crate) async fn handle_bo5_setup(setup: Setup) -> (Vec<SetupStep>, String) {
+pub fn handle_bo5_setup(setup: &Setup) -> (Vec<SetupStep>, String) {
     let match_id = setup.match_id.unwrap();
+    let team_one = setup.team_one.unwrap();
+    let team_two = setup.team_two.unwrap();
+
     (
         vec![
             SetupStep {
                 match_id,
                 step_type: Veto,
-                team_role_id: setup.team_one.unwrap() as i64,
+                team_role_id: team_one,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Veto,
-                team_role_id: setup.team_two.unwrap() as i64,
+                team_role_id: team_two,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Pick,
-                team_role_id: setup.team_one.unwrap() as i64,
+                team_role_id: team_one,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Pick,
-                team_role_id: setup.team_two.unwrap() as i64,
+                team_role_id: team_two,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Pick,
-                team_role_id: setup.team_one.unwrap() as i64,
+                team_role_id: team_one,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Pick,
-                team_role_id: setup.team_two.unwrap() as i64,
+                team_role_id: team_two,
                 map: None,
             },
             SetupStep {
                 match_id,
                 step_type: Pick,
-                team_role_id: setup.team_one.unwrap() as i64,
+                team_role_id: team_one,
                 map: None,
             },
         ],
         format!(
             "Best of 5 option selected. Starting map veto. <@&{}> bans first.\n",
-            &setup.team_one.unwrap()
+            &team_one
         ),
     )
 }
 
-pub(crate) async fn get_pg_conn(
-    context: &Context,
-) -> PooledConnection<ConnectionManager<PgConnection>> {
-    let data = context.data.write().await;
-    let pool = data.get::<DBConnectionPool>().unwrap();
-    pool.get().unwrap()
+pub async fn get_pool(context: &Context) -> Result<PgPool, Error> {
+    let data = context.data.read().await;
+    let pool = data
+        .get::<DBConnectionPool>()
+        .ok_or(Error::MissingFromContext("database pool"))?;
+    Ok(PgPool::clone(pool))
 }
 
-pub fn create_sidepick_action_row() -> CreateActionRow {
-    let mut ar = CreateActionRow::default();
-    let mut menu = CreateSelectMenu::default();
-    menu.custom_id("side_pick");
-    menu.placeholder("Select starting side");
-    menu.options(|f| {
-        f.add_option(create_menu_option(&String::from("CT"), &String::from("ct")))
-            .add_option(create_menu_option(&String::from("T"), &String::from("t")))
-    });
-    ar.add_select_menu(menu);
-    ar
-}
+pub async fn duplicate_server(
+    server_id: impl AsRef<str>,
+    auth: &DathostConfig,
+) -> anyhow::Result<DathostServerDuplicateResponse> {
+    static CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
-pub fn create_server_conn_button_row(url: &String, gotv_url: &String, show_cmds: bool) -> CreateActionRow {
-    let mut ar = CreateActionRow::default();
-    let mut conn_button = CreateButton::default();
-    conn_button.label("Connect");
-    conn_button.style(ButtonStyle::Link);
-    conn_button.emoji(ReactionType::Unicode("🛰".parse().unwrap()));
-    conn_button.url(&url);
-    ar.add_button(conn_button);
-    if show_cmds {
-        let mut console_button = CreateButton::default();
-        console_button.custom_id("console");
-        console_button.label("Console Cmds");
-        console_button.style(ButtonStyle::Secondary);
-        console_button.emoji(ReactionType::Unicode("🧾".parse().unwrap()));
-        ar.add_button(console_button);
-    }
-    let mut gotv_button = CreateButton::default();
-    gotv_button.label("GOTV");
-    gotv_button.style(ButtonStyle::Link);
-    gotv_button.emoji(ReactionType::Unicode("📺".parse().unwrap()));
-    gotv_button.url(gotv_url);
-    ar.add_button(gotv_button);
-    ar
-}
-
-pub fn create_map_action_row(map_list: Vec<String>, step_type: &StepType) -> CreateActionRow {
-    let mut ar = CreateActionRow::default();
-    let mut menu = CreateSelectMenu::default();
-    menu.custom_id("map_select");
-    menu.placeholder(format!("Select map to {}", step_type));
-    let mut options = Vec::new();
-    for map_name in map_list {
-        options.push(create_menu_option(
-            &map_name,
-            &map_name.to_ascii_lowercase(),
+    let server_id = encode(server_id.as_ref());
+    Ok(CLIENT
+        .post(format!(
+            "https://dathost.net/api/0.1/game-servers/{server_id}/duplicate"
         ))
-    }
-    menu.options(|f| f.set_options(options));
-    ar.add_select_menu(menu);
-    ar
+        .basic_auth(&auth.user, Some(&auth.password))
+        .send()
+        .await?
+        .json()
+        .await?)
 }
 
-pub fn create_server_action_row(server_list: &Vec<MatchServer>) -> CreateActionRow {
-    let mut ar = CreateActionRow::default();
-    let mut menu = CreateSelectMenu::default();
-    menu.custom_id("server_select");
-    menu.placeholder("Select server");
-    let mut options = Vec::new();
-    for server in server_list {
-        options.push(create_menu_option(&server.region_label, &server.server_id))
-    }
-    menu.options(|f| f.set_options(options));
-    ar.add_select_menu(menu);
-    ar
-}
+pub async fn update_server(
+    server_id: impl AsRef<str>,
+    name: impl AsRef<str>,
+    token: impl AsRef<str>,
+    auth: &DathostConfig,
+) -> anyhow::Result<StatusCode> {
+    static CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
-pub fn create_menu_option(label: &str, value: &str) -> CreateSelectMenuOption {
-    let mut opt = CreateSelectMenuOption::default();
-    // This is what will be shown to the user
-    opt.label(label);
-    // This is used to identify the selected value
-    opt.value(value.to_ascii_lowercase());
-    opt
+    let server_id = encode(server_id.as_ref());
+    Ok(CLIENT
+        .put(format!(
+            "https://dathost.net/api/0.1/game-servers/{server_id}"
+        ))
+        .basic_auth(&auth.user, Some(&auth.password))
+        .form(&[
+            ("name", name.as_ref()),
+            (
+                "csgo_settings.steam_game_server_login_token",
+                token.as_ref(),
+            ),
+        ])
+        .send()
+        .await?
+        .status())
 }
 
 pub async fn start_server(
     context: &Context,
     guild_id: GuildId,
     setup: &mut Setup,
-) -> Result<DathostServerDuplicateResponse, Error> {
-    println!("{:#?}", setup);
-    let dathost_config = get_config(context).await.dathost;
-    let conn = get_pg_conn(context).await;
-    let client = Client::new();
-    println!("duplicating server");
-    let dupl_url = format!(
-        "https://dathost.net/api/0.1/game-servers/{}/duplicate",
-        encode(&setup.server_id.clone().unwrap())
-    );
-    let resp = client
-        .post(dupl_url)
-        .basic_auth(&dathost_config.user, Some(&dathost_config.password))
-        .send()
-        .await
-        .unwrap()
-        .json::<DathostServerDuplicateResponse>()
-        .await;
-    let resp = resp?;
-    let server_id = resp.id.clone();
+) -> anyhow::Result<DathostServerDuplicateResponse> {
+    log::info!("{:#?}", setup);
 
-    let mut gslt = get_fresh_token(&conn);
-    println!("setting gslt '{}'", &gslt.token);
-    let gslt_resp = client
-        .put(format!(
-            "https://dathost.net/api/0.1/game-servers/{}",
-            encode(&server_id.to_string())
-        ))
-        .form(&[
-            ("name", format!("match-server-{}", setup.match_id.unwrap())),
-            (
-                "csgo_settings.steam_game_server_login_token",
-                gslt.token.clone(),
-            ),
-        ])
-        .basic_auth(&dathost_config.user, Some(&dathost_config.password))
-        .send()
-        .await
-        .unwrap();
-    if gslt_resp.status() == 200 {
-        gslt.in_use = true;
-        update_token(&conn, gslt);
+    let data = context.data.write().await;
+    let config: &Config = data.get::<Config>().unwrap();
+
+    let dathost_config = &config.dathost;
+    let pool = get_pool(context).await?;
+
+    log::info!("duplicating server");
+    let server = duplicate_server(setup.server_id.as_ref().unwrap(), dathost_config).await?;
+    let server_id = &server.id;
+
+    let mut game_server_login_token = get_fresh_token(&pool)
+        .await?
+        .ok_or_else(|| anyhow!("no game server login token found"))?;
+
+    log::info!("updating game server with name and gslt");
+    let match_id = setup.match_id.unwrap();
+    let status = update_server(
+        server_id,
+        format!("match-server-{match_id}"),
+        &game_server_login_token.token,
+        dathost_config,
+    )
+    .await?;
+    if status.is_success() {
+        game_server_login_token.in_use = true;
+        update_token(&pool, &game_server_login_token).await?;
     }
-    let users: Vec<User> = context
+
+    let members: Vec<Member> = context
         .http
         .get_guild_members(*guild_id.as_u64(), None, None)
-        .await
-        .unwrap()
-        .iter()
-        .map(|u| u.user.clone())
-        .collect();
-    let mut team_one_users = Vec::new();
-    let mut team_two_users = Vec::new();
-    for u in users {
-        if u.has_role(&context, guild_id, setup.team_one.unwrap() as u64)
-            .await
-            .unwrap()
-        {
-            team_one_users.push(u.clone());
-        }
-        if u.has_role(&context, guild_id, setup.team_two.unwrap() as u64)
-            .await
-            .unwrap()
-        {
-            team_two_users.push(u.clone());
-        }
-    }
-    println!("1: {:#?}", team_one_users);
-    println!("2: {:#?}", team_two_users);
-    let conn = get_pg_conn(context).await;
-    setup.team_one_conn_str = Some(map_steamid_strings(team_one_users, &conn));
-    setup.team_two_conn_str = Some(map_steamid_strings(team_two_users, &conn));
-    println!(
+        .await?;
+
+    let team_one = setup.team_one.unwrap() as u64;
+    let team_two = setup.team_two.unwrap() as u64;
+    let (team_one_users, team_two_users) = stream::iter(members)
+        .map(|member| member.user)
+        .then(|user| async move {
+            if user.has_role(&context, guild_id, team_one).await? {
+                return Ok(Some((Some(user), None)));
+            }
+
+            if user.has_role(&context, guild_id, team_two).await? {
+                return Ok(Some((None, Some(user))));
+            }
+
+            Result::<_, anyhow::Error>::Ok(None)
+        })
+        .filter_map(|user| async move { user.ok() })
+        .filter_map(|user| async move { user })
+        .collect::<(Vec<_>, Vec<_>)>()
+        .await;
+    let team_one_users = team_one_users.iter().flatten().collect::<Vec<_>>();
+    let team_two_users = team_two_users.iter().flatten().collect::<Vec<_>>();
+    log::info!("1: {:#?}", team_one_users);
+    log::info!("2: {:#?}", team_two_users);
+
+    setup.team_one_conn_str = Some(map_steamid_strings(context, team_one_users).await?);
+    setup.team_two_conn_str = Some(map_steamid_strings(context, team_two_users).await?);
+    log::info!(
         "starting match\nteam1 '{}'\nteam2: '{}'",
-        setup.clone().team_one_conn_str.unwrap(),
-        setup.clone().team_two_conn_str.unwrap()
+        setup.team_one_conn_str.as_deref().unwrap(),
+        setup.team_two_conn_str.as_deref().unwrap()
     );
-    let start_resp = match setup.series_type {
-        SeriesType::Bo1 => start_match(server_id, setup, client, &dathost_config).await,
-        SeriesType::Bo3 => start_series_match(server_id, setup, client, &dathost_config).await,
-        SeriesType::Bo5 => start_series_match(server_id, setup, client, &dathost_config).await,
+
+    let response = match setup.series_type {
+        SeriesType::Bo1 => start_match(server_id, setup, dathost_config).await?,
+        SeriesType::Bo3 => start_series_match(server_id, setup, dathost_config).await?,
+        SeriesType::Bo5 => start_series_match(server_id, setup, dathost_config).await?,
     };
-    if let Err(err) = start_resp {
-        eprintln!("{:#?}", err);
-        return Err(err);
-    }
-    println!("{:#?}", start_resp.unwrap().text().await.unwrap());
-    Ok(resp)
+
+    log::info!("{:#?}", response.text().await?);
+    Ok(server)
 }
 
 pub async fn start_match(
-    server_id: String,
+    server_id: impl AsRef<str>,
     setup: &Setup,
-    client: Client,
     dathost_config: &DathostConfig,
-) -> Result<Response, Error> {
-    let start_match_url = String::from("https://dathost.net/api/0.1/matches");
-    let team_ct: String;
-    let team_t: String;
-    let team_ct_name: String;
-    let team_t_name: String;
-    let new_match = setup.maps[0].clone();
-    if setup.maps[0].start_defense_team_role_id == setup.team_one {
-        team_ct = setup.team_one_conn_str.clone().unwrap();
-        team_ct_name = setup.team_one_name.clone();
-        team_t = setup.team_two_conn_str.clone().unwrap();
-        team_t_name = setup.team_two_name.clone();
-    } else {
-        team_ct = setup.team_two_conn_str.clone().unwrap();
-        team_ct_name = setup.team_two_name.clone();
-        team_t = setup.team_one_conn_str.clone().unwrap();
-        team_t_name = setup.team_one_name.clone();
-    }
-    println!("starting match request...");
-    client
-        .post(&start_match_url)
+) -> anyhow::Result<Response> {
+    static CLIENT: Lazy<Client> = Lazy::new(Client::new);
+
+    let (mut team_ct, mut team_ct_name, mut team_t, mut team_t_name) = (
+        setup.team_one_conn_str.as_deref().unwrap(),
+        setup.team_one_name.as_str(),
+        setup.team_two_conn_str.as_deref().unwrap(),
+        setup.team_two_name.as_str(),
+    );
+
+    if setup.maps[0].start_defense_team_role_id != setup.team_one {
+        core::mem::swap(&mut team_ct, &mut team_t);
+        core::mem::swap(&mut team_ct_name, &mut team_t_name);
+    };
+
+    log::info!("starting match request...");
+    Ok(CLIENT
+        .post("https://dathost.net/api/0.1/matches")
         .form(&[
-            ("game_server_id", &&server_id),
-            ("map", &&new_match.map),
-            ("team1_name", &&team_t_name),
-            ("team2_name", &&team_ct_name),
-            ("team1_steam_ids", &&team_t),
-            ("team2_steam_ids", &&team_ct),
-            ("enable_pause", &&String::from("true")),
-            ("enable_tech_pause", &&String::from("true")),
+            ("game_server_id", server_id.as_ref()),
+            ("map", setup.maps[0].map.as_str()),
+            ("team1_name", team_t_name),
+            ("team2_name", team_ct_name),
+            ("team1_steam_ids", team_t),
+            ("team2_steam_ids", team_ct),
+            ("enable_pause", "true"),
+            ("enable_tech_pause", "true"),
         ])
         .basic_auth(&dathost_config.user, Some(&dathost_config.password))
         .send()
-        .await
+        .await?)
 }
 
 pub async fn start_series_match(
-    server_id: String,
+    server_id: impl AsRef<str>,
     setup: &mut Setup,
-    client: Client,
     dathost_config: &DathostConfig,
-) -> Result<Response, Error> {
-    let start_match_url = String::from("https://dathost.net/api/0.1/match-series");
-    let team_one = setup.team_one_conn_str.clone().unwrap();
-    let team_one_name = setup.team_one_name.clone();
-    let team_two = setup.team_two_conn_str.clone().unwrap();
-    let team_two_name = setup.team_two_name.clone();
-    let mut params: HashMap<&str, &str> = HashMap::new();
-    let team_map = HashMap::from([
-        (setup.team_one.unwrap(), "team1"),
-        (setup.team_two.unwrap(), "team2"),
+) -> anyhow::Result<Response> {
+    static CLIENT: Lazy<Client> = Lazy::new(Client::new);
+
+    let team_one = setup.team_one_conn_str.as_deref().unwrap();
+    let team_one_name = setup.team_one_name.as_str();
+    let team_two = setup.team_two_conn_str.as_deref().unwrap();
+    let team_two_name = setup.team_two_name.as_str();
+
+    let which_team = |role_id| {
+        if role_id == setup.team_one {
+            "team1"
+        } else {
+            "team2"
+        }
+    };
+
+    let mut params = HashMap::from([
+        ("game_server_id", server_id.as_ref()),
+        ("enable_pause", "true"),
+        ("enable_tech_pause", "true"),
+        ("team1_name", team_one_name),
+        ("team2_name", team_two_name),
+        ("team1_steam_ids", team_one),
+        ("team2_steam_ids", team_two),
+        ("number_of_maps", "3"),
+        ("map1", setup.maps[0].map.as_str()),
+        (
+            "map1_start_ct",
+            which_team(setup.maps[0].start_defense_team_role_id),
+        ),
+        ("map2", setup.maps[1].map.as_str()),
+        (
+            "map2_start_ct",
+            which_team(setup.maps[1].start_defense_team_role_id),
+        ),
+        ("map3", setup.maps[2].map.as_str()),
+        (
+            "map3_start_ct",
+            which_team(setup.maps[2].start_defense_team_role_id),
+        ),
     ]);
-    let mut num_maps = "3";
-    params.insert("game_server_id", server_id.as_str());
-    params.insert("enable_pause", "true");
-    params.insert("enable_tech_pause", "true");
-    params.insert("team1_name", team_one_name.as_str());
-    params.insert("team2_name", team_two_name.as_str());
-    params.insert("team1_steam_ids", team_one.as_str());
-    params.insert("team2_steam_ids", team_two.as_str());
-    params.insert("map1", setup.maps[0].map.as_str());
-    params.insert(
-        "map1_start_ct",
-        team_map
-            .get(&setup.maps[0].start_defense_team_role_id.unwrap())
-            .unwrap(),
-    );
-    params.insert("map2", setup.maps[1].map.as_str());
-    params.insert(
-        "map2_start_ct",
-        team_map
-            .get(&setup.maps[1].start_defense_team_role_id.unwrap())
-            .unwrap(),
-    );
-    params.insert("map3", setup.maps[2].map.as_str());
-    params.insert(
-        "map3_start_ct",
-        team_map
-            .get(&setup.maps[2].start_defense_team_role_id.unwrap())
-            .unwrap(),
-    );
-    if setup.series_type == Bo5 {
-        num_maps = "5";
+
+    if setup.series_type == SeriesType::Bo5 {
         params.insert("map4", setup.maps[3].map.as_str());
         params.insert(
             "map4_start_ct",
-            team_map
-                .get(&setup.maps[3].start_defense_team_role_id.unwrap())
-                .unwrap(),
+            which_team(setup.maps[3].start_defense_team_role_id),
         );
         params.insert("map5", setup.maps[4].map.as_str());
         params.insert(
             "map5_start_ct",
-            team_map
-                .get(&setup.maps[4].start_defense_team_role_id.unwrap())
-                .unwrap(),
+            which_team(setup.maps[4].start_defense_team_role_id),
         );
+        params.insert("number_of_maps", "5");
     }
-    params.insert("number_of_maps", num_maps);
-    println!("{:#?}", params);
-    client
-        .post(&start_match_url)
+
+    log::info!("{:#?}", params);
+
+    Ok(CLIENT
+        .post("https://dathost.net/api/0.1/match-series")
         .form(&params)
         .basic_auth(&dathost_config.user, Some(&dathost_config.password))
         .send()
-        .await
+        .await?)
 }
 
-pub fn map_steamid_strings(
-    users: Vec<User>,
-    conn: &PooledConnection<ConnectionManager<PgConnection>>,
-) -> String {
-    let mut str: String = users
-        .iter()
-        .map(|u| get_user_by_discord_id(conn, &i64::from(u.id)).steam_id)
-        .map(|mut s| {
-            s.replace_range(6..7, "1");
-            s
+pub async fn map_steamid_strings(context: &Context, users: Vec<&User>) -> anyhow::Result<String> {
+    let pool = get_pool(context).await?;
+    Ok(stream::iter(users)
+        .map(|user| *user.id.as_u64())
+        .map(DiscordId::from)
+        .then(|discord_id| get_user_by_discord_id(&pool, discord_id))
+        .filter_map(|user| async move {
+            match &user {
+                Ok(Some(_)) => {}
+                Ok(None) => log::warn!("User not found in database"),
+                Err(e) => log::error!("Error getting user: {}", e),
+            }
+            user.ok().flatten()
         })
-        .map(|s| format!("{},", s))
-        .collect();
-    str.remove(str.len() - 1);
-    str
+        .map(|user| SteamId::from(user.steam_id).steam2id())
+        .collect::<Vec<_>>()
+        .await
+        .join(","))
 }
 
-pub async fn create_conn_message(
+pub async fn create_tiny_url(url: impl AsRef<str>) -> anyhow::Result<String> {
+    static CLIENT: Lazy<Client> = Lazy::new(Client::new);
+    Ok(CLIENT
+        .get(format!(
+            "https://tinyurl.com/api-create.php?url={}",
+            encode(url.as_ref())
+        ))
+        .send()
+        .await?
+        .text_with_charset("utf-8")
+        .await?)
+}
+
+pub async fn connect_message(
     context: &Context,
-    msg: &Message,
+    message: &Message,
     server: DathostServerDuplicateResponse,
     setup: &Setup,
-) {
-    let client = Client::new();
+) -> anyhow::Result<()> {
     let game_url = format!("{}:{}", server.ip, server.ports.game);
     let gotv_url = format!("{}:{}", server.ip, server.ports.gotv);
     let url_link = format!("steam://connect/{}", &game_url);
     let gotv_link = format!("steam://connect/{}", &gotv_url);
-    let resp = client
-        .get(format!(
-            "https://tinyurl.com/api-create.php?url={}",
-            encode(&url_link)
-        ))
-        .send()
-        .await
-        .unwrap();
-    let t_url = resp.text_with_charset("utf-8").await.unwrap();
-    let resp = client
-        .get(format!(
-            "https://tinyurl.com/api-create.php?url={}",
-            encode(&gotv_link)
-        ))
-        .send()
-        .await
-        .unwrap();
-    let t_gotv_url = resp.text_with_charset("utf-8").await.unwrap();
 
-    let mut m = msg.channel_id
-        .send_message(&context, |m| m.content(eos_printout(setup))
-        .components(|c|
-            c.add_action_row(
-                create_server_conn_button_row(&t_url, &t_gotv_url, true)
-            )),
-    ).await.unwrap();
-    let mut cib = m
-        .await_component_interactions(&context)
+    let t_game_url = create_tiny_url(url_link).await?;
+    let t_gotv_url = create_tiny_url(gotv_link).await?;
+
+    let mut message = message
+        .channel_id
+        .send_message(context, |message| {
+            message
+                .content(eos_printout(setup))
+                .components(|components| {
+                    components.add_action_row(create_server_conn_button_row(
+                        &t_game_url,
+                        &t_gotv_url,
+                        true,
+                    ))
+                })
+        })
+        .await?;
+
+    let mut interaction_collector = message
+        .await_component_interactions(context)
         .timeout(Duration::from_secs(60 * 5))
         .build();
-    loop {
-        let opt = cib.next().await;
-        match opt {
-            Some(mci) => {
-                mci.create_interaction_response(&context, |r| {
-                    r.kind(InteractionResponseType::ChannelMessageWithSource).interaction_response_data(|d| {
-                        d.ephemeral(true).content(format!("Console: ||`connect {}`||\nGOTV: ||`connect {}`||", &game_url, &gotv_url))
+
+    while let Some(interaction) = interaction_collector.next().await {
+        interaction
+            .create_interaction_response(context, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|response_data| {
+                        response_data.ephemeral(true).content(format!(
+                            "Console: ||`connect {}`||\nGOTV: ||`connect {}`||",
+                            &game_url, &gotv_url
+                        ))
                     })
-                }).await.unwrap();
-            }
-            None => {
-                // remove console cmds interaction on timeout
-                m.edit(&context, |m|
-                    m.content(eos_printout(&setup))
-                        .components(|c|
-                            c.add_action_row(create_server_conn_button_row(&t_url, &t_gotv_url, false)
-                            )
-                        ),
-                ).await.unwrap();
-                return;
-            }
-        }
+            })
+            .await?;
+    }
+
+    message
+        .edit(context, |message| {
+            message
+                .content(eos_printout(setup))
+                .components(|components| {
+                    components.add_action_row(create_server_conn_button_row(
+                        &t_game_url,
+                        &t_gotv_url,
+                        false,
+                    ))
+                })
+        })
+        .await?;
+    Ok(())
+}
+
+pub fn get_option(
+    interaction: &ApplicationCommandInteraction,
+    index: usize,
+) -> anyhow::Result<&CommandDataOptionValue> {
+    interaction
+        .data
+        .options
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("No option at index {}", index))?
+        .resolved
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No resolved value at index {}", index))
+}
+
+pub fn get_option_as_bool(
+    interaction: &ApplicationCommandInteraction,
+    index: usize,
+) -> anyhow::Result<bool> {
+    match get_option(interaction, index)? {
+        CommandDataOptionValue::Boolean(value) => Ok(*value),
+        _ => Err(anyhow::anyhow!("Option at index {} is not a bool", index)),
     }
 }
 
-pub async fn get_config(context: &Context) -> Config {
-    let data = context.data.write().await;
-    let config: &Config = data.get::<Config>().unwrap();
-    config.clone()
+pub fn get_option_as_string(
+    interaction: &ApplicationCommandInteraction,
+    index: usize,
+) -> anyhow::Result<&String> {
+    match get_option(interaction, index)? {
+        CommandDataOptionValue::String(value) => Ok(value),
+        _ => Err(anyhow::anyhow!("Option at index {} is not a string", index)),
+    }
+}
+
+pub fn get_option_as_integer(
+    interaction: &ApplicationCommandInteraction,
+    index: usize,
+) -> anyhow::Result<i64> {
+    match get_option(interaction, index)? {
+        CommandDataOptionValue::Integer(value) => Ok(*value),
+        _ => Err(anyhow::anyhow!(
+            "Option at index {} is not a integer",
+            index
+        )),
+    }
+}
+
+pub fn get_option_as_role(
+    interaction: &ApplicationCommandInteraction,
+    index: usize,
+) -> anyhow::Result<&Role> {
+    match get_option(interaction, index)? {
+        CommandDataOptionValue::Role(value) => Ok(value),
+        _ => Err(anyhow::anyhow!("Option at index {} is not a role", index)),
+    }
 }

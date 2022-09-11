@@ -1,27 +1,32 @@
-use diesel::PgConnection;
+#[warn(clippy::pedantic)]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines
+)]
+mod commands;
+mod dathost_models;
+mod error;
+mod utils;
+
 use std::env;
 use std::str::FromStr;
 
+use csgo_matchbot::models::{Match, SeriesType, StepType};
+use error::Error;
 use serde::{Deserialize, Serialize};
 use serenity::async_trait;
 use serenity::client::Context;
 use serenity::framework::standard::StandardFramework;
-use serenity::Client;
-
-use serenity::model::prelude::GuildId;
-use serenity::model::prelude::Ready;
-use serenity::prelude::{EventHandler, GatewayIntents, TypeMapKey};
-
-use csgo_matchbot::models::{Match, SeriesType, StepType};
-use r2d2::Pool;
-use r2d2_diesel::ConnectionManager;
 use serenity::model::application::command::CommandOptionType;
 use serenity::model::application::interaction::application_command::ApplicationCommandInteraction;
 use serenity::model::application::interaction::{Interaction, InteractionResponseType};
-
-mod commands;
-mod dathost_models;
-mod utils;
+use serenity::model::prelude::GuildId;
+use serenity::model::prelude::Ready;
+use serenity::prelude::{EventHandler, GatewayIntents, TypeMapKey};
+use serenity::Client;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -122,31 +127,36 @@ impl TypeMapKey for Matches {
 }
 
 impl TypeMapKey for DBConnectionPool {
-    type Value = Pool<ConnectionManager<PgConnection>>;
+    type Value = PgPool;
 }
 
+#[derive(Debug)]
+#[repr(u8)]
 enum Command {
-    SteamId,
-    Schedule,
-    Addmatch,
-    Deletematch,
+    AddMatch,
+    DeleteMatch,
+    Maps,
     Match,
     Matches,
-    Maps,
+    Schedule,
+    Setup,
+    SteamId,
 }
 
 impl FromStr for Command {
-    type Err = ();
+    type Err = Error;
+
     fn from_str(input: &str) -> Result<Command, Self::Err> {
         match input {
-            "steamid" => Ok(Command::SteamId),
-            "schedule" => Ok(Command::Schedule),
-            "addmatch" => Ok(Command::Addmatch),
-            "deletematch" => Ok(Command::Deletematch),
+            "addmatch" => Ok(Command::AddMatch),
+            "deletematch" => Ok(Command::DeleteMatch),
+            "maps" => Ok(Command::Maps),
             "match" => Ok(Command::Match),
             "matches" => Ok(Command::Matches),
-            "maps" => Ok(Command::Maps),
-            _ => Err(()),
+            "schedule" => Ok(Command::Schedule),
+            "setup" => Ok(Command::Setup),
+            "steamid" => Ok(Command::SteamId),
+            _ => Err(Error::UnknownCommand(input.to_string())),
         }
     }
 }
@@ -154,7 +164,8 @@ impl FromStr for Command {
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, context: Context, ready: Ready) {
-        let config = load_config().await.unwrap();
+        let data = context.data.read().await;
+        let config = data.get::<Config>().unwrap();
         let guild_id = GuildId(config.discord.guild_id);
         let commands = GuildId::set_application_commands(&guild_id, &context.http, |commands| {
             return commands
@@ -267,27 +278,38 @@ impl EventHandler for Handler {
         println!("{} is connected!", ready.user.name);
         log::debug!("Added these guild slash commands: {:#?}", commands);
     }
+
     async fn interaction_create(&self, context: Context, interaction: Interaction) {
-        if let Interaction::ApplicationCommand(inc_command) = interaction {
-            let command = inc_command.data.name.as_str().to_lowercase();
+        if let Interaction::ApplicationCommand(interaction) = interaction {
+            let command = interaction.data.name.to_lowercase();
+
             if let Ok(normal_command) = Command::from_str(&command) {
-                let content: String = match normal_command {
-                    Command::SteamId => commands::handle_steam_id(&context, &inc_command).await,
-                    Command::Addmatch => commands::handle_add_match(&context, &inc_command).await,
-                    Command::Deletematch => {
-                        commands::handle_delete_match(&context, &inc_command).await
+                let response = match normal_command {
+                    Command::AddMatch => commands::handle_add_match(&context, &interaction).await,
+                    Command::DeleteMatch => {
+                        commands::handle_delete_match(&context, &interaction).await
                     }
-                    Command::Schedule => commands::handle_schedule(&context, &inc_command).await,
-                    Command::Match => commands::handle_match(&context, &inc_command).await,
-                    Command::Matches => commands::handle_matches(&context, &inc_command).await,
                     Command::Maps => commands::handle_map_list(&context).await,
+                    Command::Match => commands::handle_match(&context, &interaction).await,
+                    Command::Matches => commands::handle_matches(&context, &interaction).await,
+                    Command::Schedule => commands::handle_schedule(&context, &interaction).await,
+                    Command::Setup => commands::handle_setup(&context, &interaction).await,
+                    Command::SteamId => commands::handle_steam_id(&context, &interaction).await,
                 };
-                if let Err(why) = create_int_resp(&context, &inc_command, content).await {
-                    eprintln!("Cannot respond to slash command: {}", why);
+
+                match response {
+                    Ok(Some(response)) => {
+                        if let Err(why) =
+                            create_int_resp(&context, &interaction, response.into_owned()).await
+                        {
+                            log::error!("Cannot respond to slash command: {}", why);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        log::error!("Error handling command: {}", err);
+                    }
                 }
-            }
-            if command == "setup" {
-                commands::handle_setup(&context, &inc_command).await;
             }
         }
     }
@@ -299,7 +321,7 @@ async fn create_int_resp(
     content: String,
 ) -> serenity::Result<()> {
     inc_command
-        .create_interaction_response(&context.http, |response| {
+        .create_interaction_response(context, |response| {
             response
                 .kind(InteractionResponseType::ChannelMessageWithSource)
                 .interaction_response_data(|message| message.ephemeral(true).content(content))
@@ -307,14 +329,42 @@ async fn create_int_resp(
         .await
 }
 
+fn config_from_env() -> Result<Config, Error> {
+    use dotenvy::var;
+
+    Ok(Config {
+        discord: DiscordConfig {
+            token: var("DISCORD_TOKEN")?,
+            admin_role_id: var("DISCORD_ADMIN_ROLE_ID")?.parse()?,
+            application_id: var("DISCORD_APPLICATION_ID")?.parse()?,
+            guild_id: var("DISCORD_GUILD_ID")?.parse()?,
+        },
+        dathost: DathostConfig {
+            user: var("DATHOST_USER")?,
+            password: var("DATHOST_PASSWORD")?,
+        },
+    })
+}
+
+pub async fn establish_pool() -> Result<PgPool, Error> {
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    Ok(PgPoolOptions::new()
+        .max_connections(15)
+        .connect(&database_url)
+        .await?)
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Error> {
+    let _ = dotenvy::dotenv();
     env_logger::init();
-    let config = load_config().await.unwrap();
+
+    let config = config_from_env()?;
+
     let token = &config.discord.token;
     let framework = StandardFramework::new();
     let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
-    let mut client = Client::builder(&token, intents)
+    let mut client = Client::builder(token, intents)
         .event_handler(Handler {})
         .framework(framework)
         .application_id(config.discord.application_id)
@@ -323,50 +373,11 @@ async fn main() {
     {
         let mut data = client.data.write().await;
         data.insert::<Config>(config);
-        data.insert::<DBConnectionPool>(get_connection_pool());
+        data.insert::<DBConnectionPool>(establish_pool().await?);
     }
     if let Err(why) = client.start().await {
         println!("Client error: {:?}", why);
     }
-}
 
-pub fn get_connection_pool() -> Pool<ConnectionManager<PgConnection>> {
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let manager = ConnectionManager::<PgConnection>::new(database_url);
-    Pool::builder()
-        .test_on_check_out(true)
-        .max_size(15)
-        .build(manager)
-        .expect("Could not build connection pool")
-}
-
-async fn load_config() -> Result<Config, serde_yaml::Error> {
-    let config: Config = Config {
-        discord: DiscordConfig {
-            token: env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN not defined"),
-            admin_role_id: env::var("DISCORD_ADMIN_ROLE_ID")
-                .expect("DISCORD_ADMIN_ROLE_ID not defined")
-                .parse()
-                .unwrap(),
-            application_id: env::var("DISCORD_APPLICATION_ID")
-                .expect("DISCORD_APPLICATION_ID not defined")
-                .parse()
-                .unwrap(),
-            guild_id: env::var("DISCORD_GUILD_ID")
-                .expect("DISCORD_GUILD_ID not defined")
-                .parse()
-                .unwrap(),
-        },
-        dathost: DathostConfig {
-            user: env::var("DATHOST_USER")
-                .expect("DATHOST_USER not defined")
-                .parse()
-                .unwrap(),
-            password: env::var("DATHOST_PASSWORD")
-                .expect("DATHOST_PASSWORD not defined")
-                .parse()
-                .unwrap(),
-        },
-    };
-    Ok(config)
+    Ok(())
 }
